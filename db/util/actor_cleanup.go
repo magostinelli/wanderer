@@ -1,0 +1,321 @@
+package util
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/pocketbase/dbx"
+	"github.com/pocketbase/pocketbase/core"
+)
+
+// RemoteActorReferenceCount checks every PocketBase relation field that points
+// to activitypub_actors, then checks the non-relation ActivityPub payloads
+// that store actor identities as IRIs and notification metadata that stores
+// handles. Unknown/query errors are returned and must block deletion.
+func RemoteActorReferenceCount(app core.App, actor *core.Record) (int64, error) {
+	if actor == nil || actor.GetBool("is_local") {
+		return 0, errors.New("expected a remote actor")
+	}
+
+	collections, err := app.FindAllCollections()
+	if err != nil {
+		return 0, fmt.Errorf("list collections: %w", err)
+	}
+
+	total := int64(0)
+	for _, collection := range collections {
+		// Views are derived from base records and do not own independent
+		// references. Counting them would double-count relation fields.
+		if collection.IsView() {
+			continue
+		}
+		for _, field := range collection.Fields {
+			relation, ok := field.(*core.RelationField)
+			if !ok || relation.CollectionId != actor.Collection().Id {
+				continue
+			}
+			// These author relations are handled by DeleteRemoteActor, which
+			// permits remote copies but refuses records with local identities.
+			if field.GetName() == "author" && isRemoteCopyCollection(collection.Name) {
+				continue
+			}
+
+			var count int64
+			if relation.IsMultiple() {
+				// Multi-select relations are stored as JSON arrays in SQLite.
+				column := "\"" + strings.ReplaceAll(field.GetName(), "\"", "\"\"") + "\""
+				count, err = app.CountRecords(collection.Name, dbx.NewExp(
+					"EXISTS (SELECT 1 FROM json_each("+column+") WHERE value={:id})",
+					dbx.Params{"id": actor.Id},
+				))
+			} else {
+				count, err = app.CountRecords(collection.Name, dbx.HashExp{field.GetName(): actor.Id})
+			}
+			if err != nil {
+				return 0, fmt.Errorf("count %s.%s references: %w", collection.Name, field.GetName(), err)
+			}
+			total += count
+		}
+	}
+
+	iri := actor.GetString("iri")
+	if iri == "" {
+		return 0, errors.New("remote actor has no IRI")
+	}
+
+	// Activity records use actor IRIs rather than PocketBase relation IDs.
+	// Search all fields that can carry the actor or its audience/object links.
+	activityCount, err := app.CountRecords("activitypub_activities", dbx.NewExp(
+		"COALESCE(actor, '') != {:iri} AND (instr(COALESCE(object, ''), {:iri}) > 0 OR instr(COALESCE(cc, ''), {:iri}) > 0 OR instr(COALESCE(\"to\", ''), {:iri}) > 0 OR instr(COALESCE(relation, ''), {:iri}) > 0 OR instr(COALESCE(object, ''), {:id}) > 0 OR instr(COALESCE(cc, ''), {:id}) > 0 OR instr(COALESCE(\"to\", ''), {:id}) > 0 OR instr(COALESCE(relation, ''), {:id}) > 0)",
+		dbx.Params{"iri": iri, "id": actor.Id},
+	))
+	if err != nil {
+		return 0, fmt.Errorf("count ActivityPub activity references: %w", err)
+	}
+	total += activityCount
+
+	// Notifications currently store a human-readable handle in metadata.
+	// This is deliberately a substring match: a false positive is safer than
+	// removing an actor whose handle is still embedded in a notification.
+	username, domain := actor.GetString("preferred_username"), actor.GetString("domain")
+	metadataFilter := "instr(COALESCE(metadata, ''), {:iri}) > 0 OR instr(COALESCE(metadata, ''), {:id}) > 0"
+	metadataParams := dbx.Params{"iri": iri, "id": actor.Id}
+	if username != "" && domain != "" {
+		metadataFilter += " OR instr(COALESCE(metadata, ''), {:handle}) > 0"
+		metadataParams["handle"] = "@" + username + "@" + domain
+	}
+	notificationCount, err := app.CountRecords("notifications", dbx.NewExp(metadataFilter, metadataParams))
+	if err != nil {
+		return 0, fmt.Errorf("count notification metadata references: %w", err)
+	}
+	total += notificationCount
+
+	return total, nil
+}
+
+// DeleteUnreferencedRemoteActor deletes only a remote actor with no known
+// references. The check and deletion share a transaction. Normal PocketBase
+// delete hooks remain enabled: they purge the actor's local ActivityPub
+// activities and remove the Meilisearch document. The federation delete hook
+// is safe for remote actors: CreateActorDeleteActivity explicitly returns
+// without creating or delivering a Delete activity when is_local is false.
+func DeleteUnreferencedRemoteActor(app core.App, actor *core.Record) error {
+	if actor == nil || actor.GetBool("is_local") {
+		return errors.New("refusing to delete a local or nil actor")
+	}
+
+	return app.RunInTransaction(func(txApp core.App) error {
+		// Re-fetch inside the transaction to avoid deleting a stale record.
+		current, err := txApp.FindRecordById("activitypub_actors", actor.Id)
+		if err != nil {
+			return fmt.Errorf("reload actor %s: %w", actor.Id, err)
+		}
+		if current.GetBool("is_local") || current.GetString("iri") != actor.GetString("iri") {
+			return errors.New("actor identity changed or actor is local")
+		}
+
+		count, err := RemoteActorReferenceCount(txApp, current)
+		if err != nil {
+			return err
+		}
+		if count != 0 {
+			return fmt.Errorf("actor %s still has %d reference(s)", current.Id, count)
+		}
+
+		// Reuse the project's established remote-copy validation and record
+		// deletion path. It rejects records carrying local identities.
+		return deleteRemoteActorInTransaction(txApp, current)
+	})
+}
+
+
+
+ 
+// RemoteActorCandidate is a remote actor that the reference scan found unused.
+type RemoteActorCandidate struct {
+	ID                 string
+	IRI                string
+	PreferredUsername  string
+	Domain             string
+}
+
+// StreamUnreferencedRemoteActors evaluates the full reference graph and streams
+// unreferenced actors in stable ID order. Relation references are filtered in
+// SQLite; unstructured payloads are scanned once with a multi-pattern matcher.
+// The callback may stop the scan by returning an error.
+// StreamUnreferencedRemoteActors evaluates the reference graph and streams
+// unreferenced actors in stable ID order. Candidates are processed in bounded
+// batches so the matcher and its reference bitmap never grow with the full
+// remote actor cache. Activity and notification payloads are rescanned for
+// each batch; this intentionally trades runtime for predictable memory use.
+// The callback may stop the scan by returning an error.
+func StreamUnreferencedRemoteActors(app core.App, afterID string, visit func(RemoteActorCandidate) error) error {
+	if visit == nil {
+		return errors.New("missing actor candidate visitor")
+	}
+
+	const batchSize = 5000
+
+	actorCollection, err := app.FindCachedCollectionByNameOrId("activitypub_actors")
+	if err != nil {
+		return fmt.Errorf("find actor collection: %w", err)
+	}
+	collections, err := app.FindAllCollections()
+	if err != nil {
+		return fmt.Errorf("list collections: %w", err)
+	}
+
+	references := make([]string, 0)
+	for _, collection := range collections {
+		if collection.IsView() {
+			continue
+		}
+		for _, field := range collection.Fields {
+			relation, ok := field.(*core.RelationField)
+			if !ok || relation.CollectionId != actorCollection.Id {
+				continue
+			}
+			if field.GetName() == "author" && isRemoteCopyCollection(collection.Name) {
+				continue
+			}
+
+			table := quoteIdentifier(collection.Name)
+			column := quoteIdentifier(field.GetName())
+			if relation.IsMultiple() {
+				references = append(references,
+					"SELECT relation_values.value AS actor_id FROM "+table+
+						", json_each("+column+") AS relation_values WHERE relation_values.value <> ''")
+			} else {
+				references = append(references,
+					"SELECT "+column+" AS actor_id FROM "+table+" WHERE "+column+" <> ''")
+			}
+		}
+	}
+
+	referenceCTE := "SELECT '' WHERE 0"
+	if len(references) > 0 {
+		referenceCTE = strings.Join(references, " UNION ALL ")
+	}
+	candidateQuery := "WITH refs(actor_id) AS (" + referenceCTE + ") " +
+		"SELECT a.id, a.iri, a.preferred_username, a.domain " +
+		"FROM activitypub_actors a " +
+		"WHERE a.is_local = 0 AND a.iri <> '' AND a.id > {:after} " +
+		"AND NOT EXISTS (SELECT 1 FROM refs r WHERE r.actor_id = a.id) " +
+		"ORDER BY a.id LIMIT {:limit}"
+
+	cursor := afterID
+	for {
+		candidateRows, err := app.DB().NewQuery(candidateQuery).Bind(dbx.Params{
+			"after": cursor, "limit": batchSize,
+		}).Rows()
+		if err != nil {
+			return fmt.Errorf("query relation-unreferenced remote actors: %w", err)
+		}
+
+		candidates := make([]RemoteActorCandidate, 0, batchSize)
+		matcher := newActorReferenceMatcher()
+		for candidateRows.Next() {
+			var candidate RemoteActorCandidate
+			if err := candidateRows.Scan(&candidate.ID, &candidate.IRI, &candidate.PreferredUsername, &candidate.Domain); err != nil {
+				candidateRows.Close()
+				return fmt.Errorf("scan remote actor candidate: %w", err)
+			}
+			candidates = append(candidates, candidate)
+			index := len(candidates) - 1
+			matcher.add(candidate.IRI, index, actorReferenceActivity|actorReferenceNotification)
+			matcher.add(candidate.ID, index, actorReferenceActivity|actorReferenceNotification)
+			if candidate.PreferredUsername != "" && candidate.Domain != "" {
+				matcher.add("@"+candidate.PreferredUsername+"@"+candidate.Domain, index, actorReferenceNotification)
+			}
+			cursor = candidate.ID
+		}
+		if err := candidateRows.Err(); err != nil {
+			candidateRows.Close()
+			return fmt.Errorf("read remote actor candidates: %w", err)
+		}
+		if err := candidateRows.Close(); err != nil {
+			return fmt.Errorf("close remote actor candidates: %w", err)
+		}
+		if len(candidates) == 0 {
+			return nil
+		}
+
+		matcher.build()
+		referenced := make([]bool, len(candidates))
+
+		activityRows, err := app.DB().NewQuery(
+			"SELECT COALESCE(actor, ''), COALESCE(object, ''), COALESCE(cc, ''), " +
+				"COALESCE(\"to\", ''), COALESCE(relation, '') FROM activitypub_activities",
+		).Rows()
+		if err != nil {
+			return fmt.Errorf("query ActivityPub payload references: %w", err)
+		}
+		for activityRows.Next() {
+			var actor, object, cc, to, relation string
+			if err := activityRows.Scan(&actor, &object, &cc, &to, &relation); err != nil {
+				activityRows.Close()
+				return fmt.Errorf("scan ActivityPub payload references: %w", err)
+			}
+			// An actor's own outbox activity is purged with that actor. Its
+			// actor IRI is excluded as a match, but references to other actors count.
+			matcher.mark(object, actor, actorReferenceActivity, candidates, referenced)
+			matcher.mark(cc, actor, actorReferenceActivity, candidates, referenced)
+			matcher.mark(to, actor, actorReferenceActivity, candidates, referenced)
+			matcher.mark(relation, actor, actorReferenceActivity, candidates, referenced)
+		}
+		if err := activityRows.Err(); err != nil {
+			activityRows.Close()
+			return fmt.Errorf("read ActivityPub payload references: %w", err)
+		}
+		if err := activityRows.Close(); err != nil {
+			return fmt.Errorf("close ActivityPub payload references: %w", err)
+		}
+
+		notificationRows, err := app.DB().NewQuery(
+			"SELECT COALESCE(metadata, '') FROM notifications",
+		).Rows()
+		if err != nil {
+			return fmt.Errorf("query notification payload references: %w", err)
+		}
+		for notificationRows.Next() {
+			var metadata string
+			if err := notificationRows.Scan(&metadata); err != nil {
+				notificationRows.Close()
+				return fmt.Errorf("scan notification payload reference: %w", err)
+			}
+			matcher.mark(metadata, "", actorReferenceNotification, candidates, referenced)
+		}
+		if err := notificationRows.Err(); err != nil {
+			notificationRows.Close()
+			return fmt.Errorf("read notification payload references: %w", err)
+		}
+		if err := notificationRows.Close(); err != nil {
+			return fmt.Errorf("close notification payload references: %w", err)
+		}
+
+		for index, candidate := range candidates {
+			if referenced[index] {
+				continue
+			}
+			if err := visit(candidate); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func quoteIdentifier(value string) string {
+	return "\"" + strings.ReplaceAll(value, "\"", "\"\"") + "\""
+}
+
+// isRemoteCopyCollection identifies collections whose author records are
+// already validated by DeleteRemoteActor before the actor is removed.
+func isRemoteCopyCollection(name string) bool {
+	switch name {
+	case "trails", "lists", "comments", "summit_logs", "waypoints":
+		return true
+	default:
+		return false
+	}
+}
