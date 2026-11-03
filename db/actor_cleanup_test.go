@@ -46,7 +46,13 @@ func TestRemoteActorCleanupPreservesActorReferencedByFollow(t *testing.T) {
 		"username": "Remote", "preferred_username": "remote", "domain": "remote.example",
 		"iri": "https://remote.example/ap/actors/remote", "inbox": "https://remote.example/inbox", "public_key": "remote-key",
 	})
-	saveInboundRecord(t, app, "follows", map[string]any{"follower": actor.Id})
+	follower := saveInboundRecord(t, app, "activitypub_actors", map[string]any{
+		"username": "Follower", "preferred_username": "follower", "domain": "other.example",
+		"iri": "https://other.example/ap/actors/follower", "inbox": "https://other.example/inbox", "public_key": "follower-key",
+	})
+	saveInboundRecord(t, app, "follows", map[string]any{
+		"follower": follower.Id, "followee": actor.Id, "status": "accepted",
+	})
 
 	count, err := util.RemoteActorReferenceCount(app, actor)
 	if err != nil {
@@ -131,7 +137,13 @@ func TestStreamUnreferencedRemoteActorsUsesReferenceGraph(t *testing.T) {
 		"username": "Followed", "preferred_username": "followed", "domain": "remote.example",
 		"iri": "https://remote.example/ap/actors/followed", "inbox": "https://remote.example/inbox", "public_key": "remote-key",
 	})
-	saveInboundRecord(t, app, "follows", map[string]any{"follower": referenced.Id})
+	follower := saveInboundRecord(t, app, "activitypub_actors", map[string]any{
+		"username": "Follower", "preferred_username": "follower", "domain": "other.example",
+		"iri": "https://other.example/ap/actors/follower", "inbox": "https://other.example/inbox", "public_key": "follower-key",
+	})
+	saveInboundRecord(t, app, "follows", map[string]any{
+		"follower": follower.Id, "followee": referenced.Id, "status": "accepted",
+	})
 
 	var candidates []util.RemoteActorCandidate
 	err := util.StreamUnreferencedRemoteActors(app, "", func(candidate util.RemoteActorCandidate) error {
