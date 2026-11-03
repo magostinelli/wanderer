@@ -145,6 +145,18 @@ func TestStreamUnreferencedRemoteActorsUsesReferenceGraph(t *testing.T) {
 		"follower": follower.Id, "followee": referenced.Id, "status": "accepted",
 	})
 
+	// An ActivityPub payload reference must also exclude an actor even when
+	// there is no PocketBase relation pointing to it.
+	activityOnly := saveInboundRecord(t, app, "activitypub_actors", map[string]any{
+		"username": "ActivityOnly", "preferred_username": "activityonly", "domain": "remote.example",
+		"iri": "https://remote.example/ap/actors/activityonly", "inbox": "https://remote.example/inbox", "public_key": "remote-key",
+	})
+	saveInboundRecord(t, app, "activitypub_activities", map[string]any{
+		"iri": "https://another.example/activities/mention", "type": "Create",
+		"object": activityOnly.GetString("iri"), "actor": "https://another.example/actors/alice",
+		"published": time.Now(),
+	})
+
 	var candidates []util.RemoteActorCandidate
 	err := util.StreamUnreferencedRemoteActors(app, "", func(candidate util.RemoteActorCandidate) error {
 		candidates = append(candidates, candidate)
@@ -154,6 +166,6 @@ func TestStreamUnreferencedRemoteActorsUsesReferenceGraph(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(candidates) != 1 || candidates[0].ID != unused.Id {
-		t.Fatalf("unexpected cleanup candidates: %+v", candidates)
+		t.Fatalf("unexpected cleanup candidates (activity-only actor %s must be excluded): %+v", activityOnly.Id, candidates)
 	}
 }
