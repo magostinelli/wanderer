@@ -17,7 +17,6 @@ import (
 func CleanupRemoteActors(app *pocketbase.PocketBase) *cobra.Command {
 	var (
 		execute        bool
-		batchSize      int
 		afterID        string
 		maxActors      int
 		checkpointFile string
@@ -31,9 +30,6 @@ func CleanupRemoteActors(app *pocketbase.PocketBase) *cobra.Command {
 			"references are checked again inside the deletion transaction. " +
 			"Resume an interrupted scan with --after-id or --checkpoint-file.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if batchSize < 1 || batchSize > 5000 {
-				return fmt.Errorf("batch-size must be between 1 and 5000")
-			}
 			if maxActors < 0 {
 				return fmt.Errorf("max-actors cannot be negative")
 			}
@@ -49,7 +45,7 @@ func CleanupRemoteActors(app *pocketbase.PocketBase) *cobra.Command {
 				}
 			}
 
-			cmd.Printf("Remote actor cleanup: execute=%t progress-every=%d after-id=%q\n", execute, batchSize, cursor)
+			cmd.Printf("Remote actor cleanup: execute=%t after-id=%q\n", execute, cursor)
 			stopAfterLimit := errors.New("candidate limit reached")
 			stopped := false
 
@@ -83,9 +79,6 @@ func CleanupRemoteActors(app *pocketbase.PocketBase) *cobra.Command {
 						return fmt.Errorf("write checkpoint %s: %w", checkpointFile, err)
 					}
 				}
-				if processed%batchSize == 0 {
-					cmd.Printf("Progress: candidates=%d deleted=%d last-id=%s\n", processed, deleted, cursor)
-				}
 				return nil
 			})
 			if err != nil && !errors.Is(err, stopAfterLimit) {
@@ -103,7 +96,6 @@ func CleanupRemoteActors(app *pocketbase.PocketBase) *cobra.Command {
 	}
 
 	cmd.Flags().BoolVar(&execute, "execute", false, "Actually delete candidates (default: report only)")
-	cmd.Flags().IntVar(&batchSize, "batch-size", 250, "Number of candidates between progress messages (1-5000)")
 	cmd.Flags().StringVar(&afterID, "after-id", "", "Resume after this actor record ID")
 	cmd.Flags().IntVar(&maxActors, "max-actors", 0, "Stop after processing this many candidates (0 = no limit)")
 	cmd.Flags().StringVar(&checkpointFile, "checkpoint-file", "", "Read the starting ID if present and write the last processed ID here")
