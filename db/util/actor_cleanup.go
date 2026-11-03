@@ -67,7 +67,7 @@ func RemoteActorReferenceCount(app core.App, actor *core.Record) (int64, error) 
 	// Activity records use actor IRIs rather than PocketBase relation IDs.
 	// Search all fields that can carry the actor or its audience/object links.
 	activityCount, err := app.CountRecords("activitypub_activities", dbx.NewExp(
-		"COALESCE(actor, '') != {:iri} AND (instr(COALESCE(object, ''), {:iri}) > 0 OR instr(COALESCE(cc, ''), {:iri}) > 0 OR instr(COALESCE(to, ''), {:iri}) > 0 OR instr(COALESCE(relation, ''), {:iri}) > 0 OR instr(COALESCE(object, ''), {:id}) > 0 OR instr(COALESCE(cc, ''), {:id}) > 0 OR instr(COALESCE(to, ''), {:id}) > 0 OR instr(COALESCE(relation, ''), {:id}) > 0)",
+		"COALESCE(actor, '') != {:iri} AND (instr(COALESCE(object, ''), {:iri}) > 0 OR instr(COALESCE(cc, ''), {:iri}) > 0 OR instr(COALESCE("to", ''), {:iri}) > 0 OR instr(COALESCE(relation, ''), {:iri}) > 0 OR instr(COALESCE(object, ''), {:id}) > 0 OR instr(COALESCE(cc, ''), {:id}) > 0 OR instr(COALESCE("to", ''), {:id}) > 0 OR instr(COALESCE(relation, ''), {:id}) > 0)",
 		dbx.Params{"iri": iri, "id": actor.Id},
 	))
 	if err != nil {
@@ -192,11 +192,11 @@ func StreamUnreferencedRemoteActors(app core.App, afterID string, visit func(Rem
 		   ON COALESCE(x.actor, '') <> a.iri
 		  AND (instr(COALESCE(x.object, ''), a.iri) > 0
 		    OR instr(COALESCE(x.cc, ''), a.iri) > 0
-		    OR instr(COALESCE(x.to, ''), a.iri) > 0
+		    OR instr(COALESCE(x."to", ''), a.iri) > 0
 		    OR instr(COALESCE(x.relation, ''), a.iri) > 0
 		    OR instr(COALESCE(x.object, ''), a.id) > 0
 		    OR instr(COALESCE(x.cc, ''), a.id) > 0
-		    OR instr(COALESCE(x.to, ''), a.id) > 0
+		    OR instr(COALESCE(x."to", ''), a.id) > 0
 		    OR instr(COALESCE(x.relation, ''), a.id) > 0)
 		 WHERE a.is_local = 0 AND a.iri <> ''`,
 		`SELECT a.id AS actor_id
