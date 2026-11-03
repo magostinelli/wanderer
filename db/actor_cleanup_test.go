@@ -157,6 +157,27 @@ func TestStreamUnreferencedRemoteActorsUsesReferenceGraph(t *testing.T) {
 		"published": time.Now(),
 	})
 
+	// Notification metadata can refer to an actor by its human-readable handle.
+	notificationOnly := saveInboundRecord(t, app, "activitypub_actors", map[string]any{
+		"username": "NotificationOnly", "preferred_username": "notificationonly", "domain": "remote.example",
+		"iri": "https://remote.example/ap/actors/notificationonly", "inbox": "https://remote.example/inbox", "public_key": "remote-key",
+	})
+	saveInboundRecord(t, app, "notifications", map[string]any{
+		"metadata": `{"actor":"@notificationonly@remote.example"}`,
+	})
+
+	// An actor's own activity is removed with its actor and must not keep it
+	// alive merely because its own IRI appears in its object payload.
+	ownActivity := saveInboundRecord(t, app, "activitypub_actors", map[string]any{
+		"username": "OwnActivity", "preferred_username": "ownactivity", "domain": "remote.example",
+		"iri": "https://remote.example/ap/actors/ownactivity", "inbox": "https://remote.example/inbox", "public_key": "remote-key",
+	})
+	saveInboundRecord(t, app, "activitypub_activities", map[string]any{
+		"iri": "https://remote.example/activities/own", "type": "Create",
+		"object": ownActivity.GetString("iri"), "actor": ownActivity.GetString("iri"),
+		"published": time.Now(),
+	})
+
 	var candidates []util.RemoteActorCandidate
 	err := util.StreamUnreferencedRemoteActors(app, "", func(candidate util.RemoteActorCandidate) error {
 		candidates = append(candidates, candidate)
@@ -165,7 +186,12 @@ func TestStreamUnreferencedRemoteActorsUsesReferenceGraph(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(candidates) != 1 || candidates[0].ID != unused.Id {
-		t.Fatalf("unexpected cleanup candidates (activity-only actor %s must be excluded): %+v", activityOnly.Id, candidates)
+	want := map[string]bool{unused.Id: true, ownActivity.Id: true}
+	got := make(map[string]bool, len(candidates))
+	for _, candidate := range candidates {
+		got[candidate.ID] = true
+	}
+	if len(got) != len(want) || !got[unused.Id] || !got[ownActivity.Id] {
+		t.Fatalf("unexpected cleanup candidates (activity-only actor %s and notification-only actor %s must be excluded): %+v", activityOnly.Id, notificationOnly.Id, candidates)
 	}
 }
