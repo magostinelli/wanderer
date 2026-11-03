@@ -52,7 +52,7 @@ If you like wanderer and would like to give something back you can donate over [
 
 ## Documentation
 
-Please check the [website](https://wanderer.to) for the complete documentation.
+Please check the [website](https://wanderer.to) for the complete documentation. The [remote actor cleanup guide](docs/cleanup-remote-actors.md) describes the maintenance command for removing unreferenced remote ActivityPub actor cache entries.
 
 ## Contributing
 
