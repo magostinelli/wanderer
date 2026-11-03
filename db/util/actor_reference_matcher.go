@@ -94,10 +94,9 @@ func (m *actorReferenceMatcher) build() {
 	}
 }
 
-// mark sets every actor whose pattern occurs in text. excludedIRI suppresses
-// all matches for the activity's actor are ignored, mirroring the SQL actor
-// inequality. kind keeps notification-only handles out
-// of ActivityPub activity matching.
+// mark sets every actor whose pattern occurs in text. When excludedIRI is
+// non-empty, all matches for that activity's actor are ignored, mirroring the
+// SQL actor inequality. kind keeps notification-only handles out of activities.
 func (m *actorReferenceMatcher) mark(
 	text string,
 	excludedIRI string,
