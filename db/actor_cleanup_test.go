@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"pocketbase/util"
+
+	"github.com/pocketbase/pocketbase/core"
 )
 
 func TestRemoteActorCleanupDeletesOnlyUnreferencedCacheActor(t *testing.T) {
@@ -40,7 +42,7 @@ func TestRemoteActorCleanupDeletesOnlyUnreferencedCacheActor(t *testing.T) {
 	}
 }
 
-func TestRemoteActorCleanupPreservesActorReferencedByFollow(t *testing.T) {
+func TestRemoteActorCleanupPreservesActorReferencedByRelation(t *testing.T) {
 	app := newRealSchemaApp(t)
 	actor := saveInboundRecord(t, app, "activitypub_actors", map[string]any{
 		"username": "Remote", "preferred_username": "remote", "domain": "remote.example",
@@ -50,9 +52,7 @@ func TestRemoteActorCleanupPreservesActorReferencedByFollow(t *testing.T) {
 		"username": "Follower", "preferred_username": "follower", "domain": "other.example",
 		"iri": "https://other.example/ap/actors/follower", "inbox": "https://other.example/inbox", "public_key": "follower-key",
 	})
-	saveInboundRecord(t, app, "follows", map[string]any{
-		"follower": follower.Id, "followee": actor.Id, "status": "accepted",
-	})
+	saveActorRelationReference(t, app, follower, actor)
 
 	count, err := util.RemoteActorReferenceCount(app, actor)
 	if err != nil {
@@ -141,9 +141,7 @@ func TestStreamUnreferencedRemoteActorsUsesReferenceGraph(t *testing.T) {
 		"username": "Follower", "preferred_username": "follower", "domain": "other.example",
 		"iri": "https://other.example/ap/actors/follower", "inbox": "https://other.example/inbox", "public_key": "follower-key",
 	})
-	saveInboundRecord(t, app, "follows", map[string]any{
-		"follower": follower.Id, "followee": referenced.Id, "status": "accepted",
-	})
+	saveActorRelationReference(t, app, follower, referenced)
 
 	// An ActivityPub payload reference must also exclude an actor even when
 	// there is no PocketBase relation pointing to it.
@@ -195,4 +193,27 @@ func TestStreamUnreferencedRemoteActorsUsesReferenceGraph(t *testing.T) {
 	if len(got) != len(want) || !got[unused.Id] || !got[ownActivity.Id] {
 		t.Fatalf("unexpected cleanup candidates (activity-only actor %s and notification-only actor %s must be excluded): %+v", activityOnly.Id, notificationOnly.Id, candidates)
 	}
+}
+
+
+// saveActorRelationReference adds a relation field to trails for the test.
+// The production follows collection relates PocketBase users, not ActivityPub
+// actor records, so it cannot represent an actor-to-actor reference.
+func saveActorRelationReference(t *testing.T, app core.App, follower, followee *core.Record) {
+	t.Helper()
+	trails, err := app.FindCollectionByNameOrId("trails")
+	if err != nil {
+		t.Fatal(err)
+	}
+	trails.Fields.Add(&core.RelationField{
+		Name:         "cleanup_reference",
+		CollectionId: followee.Collection().Id,
+		MaxSelect:    1,
+	})
+	if err := app.Save(trails); err != nil {
+		t.Fatal(err)
+	}
+	saveInboundRecord(t, app, "trails", map[string]any{
+		"author": follower.Id, "cleanup_reference": followee.Id, "name": "Actor relation reference",
+	})
 }
