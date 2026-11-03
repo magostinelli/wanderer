@@ -209,12 +209,44 @@ func StreamUnreferencedRemoteActors(app core.App, afterID string, visit func(Rem
 		 WHERE a.is_local = 0 AND a.iri <> ''`,
 	)
 
-	query := "WITH refs(actor_id) AS (" + strings.Join(references, " UNION ALL ") + `) 
-		SELECT a.id, a.iri, a.preferred_username, a.domain
-		FROM activitypub_actors a
-		WHERE a.is_local = 0 AND a.iri <> '' AND a.id > {:after}
-		  AND NOT EXISTS (SELECT 1 FROM refs r WHERE r.actor_id = a.id)
-		ORDER BY a.id`
+	// Remove actors already referenced through PocketBase relations before
+	// comparing ActivityPub payloads. The old plan joined every cached actor
+	// against every activity/notification, even when a relation had already
+	// made that actor ineligible. Materializing this smaller set avoids that
+	// unnecessary actor × payload scan while preserving the substring checks.
+	query := "WITH refs(actor_id) AS (" + strings.Join(references, " UNION ALL ") + `),
+		candidate_actors AS MATERIALIZED (
+			SELECT a.id, a.iri, a.preferred_username, a.domain
+			FROM activitypub_actors a
+			WHERE a.is_local = 0 AND a.iri <> '' AND a.id > {:after}
+			  AND NOT EXISTS (SELECT 1 FROM refs r WHERE r.actor_id = a.id)
+		),
+		payload_refs(actor_id) AS (
+			SELECT ca.id
+			FROM candidate_actors ca
+			JOIN activitypub_activities x
+			  ON COALESCE(x.actor, '') <> ca.iri
+			 AND (instr(COALESCE(x.object, ''), ca.iri) > 0
+			   OR instr(COALESCE(x.cc, ''), ca.iri) > 0
+			   OR instr(COALESCE(x."to", ''), ca.iri) > 0
+			   OR instr(COALESCE(x.relation, ''), ca.iri) > 0
+			   OR instr(COALESCE(x.object, ''), ca.id) > 0
+			   OR instr(COALESCE(x.cc, ''), ca.id) > 0
+			   OR instr(COALESCE(x."to", ''), ca.id) > 0
+			   OR instr(COALESCE(x.relation, ''), ca.id) > 0)
+			UNION ALL
+			SELECT ca.id
+			FROM candidate_actors ca
+			JOIN notifications n
+			  ON (instr(COALESCE(n.metadata, ''), ca.iri) > 0
+			   OR instr(COALESCE(n.metadata, ''), ca.id) > 0
+			   OR (ca.preferred_username <> '' AND ca.domain <> ''
+			       AND instr(COALESCE(n.metadata, ''), '@' || ca.preferred_username || '@' || ca.domain) > 0))
+		)
+		SELECT ca.id, ca.iri, ca.preferred_username, ca.domain
+		FROM candidate_actors ca
+		WHERE NOT EXISTS (SELECT 1 FROM payload_refs p WHERE p.actor_id = ca.id)
+		ORDER BY ca.id`
 
 	rows, err := app.DB().NewQuery(query).Bind(dbx.Params{"after": afterID}).Rows()
 	if err != nil {
