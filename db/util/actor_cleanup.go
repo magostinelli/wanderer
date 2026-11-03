@@ -144,10 +144,18 @@ type RemoteActorCandidate struct {
 // unreferenced actors in stable ID order. Relation references are filtered in
 // SQLite; unstructured payloads are scanned once with a multi-pattern matcher.
 // The callback may stop the scan by returning an error.
+// StreamUnreferencedRemoteActors evaluates the reference graph and streams
+// unreferenced actors in stable ID order. Candidates are processed in bounded
+// batches so the matcher and its reference bitmap never grow with the full
+// remote actor cache. Activity and notification payloads are rescanned for
+// each batch; this intentionally trades runtime for predictable memory use.
+// The callback may stop the scan by returning an error.
 func StreamUnreferencedRemoteActors(app core.App, afterID string, visit func(RemoteActorCandidate) error) error {
 	if visit == nil {
 		return errors.New("missing actor candidate visitor")
 	}
+
+	const batchSize = 5000
 
 	actorCollection, err := app.FindCachedCollectionByNameOrId("activitypub_actors")
 	if err != nil {
@@ -189,105 +197,112 @@ func StreamUnreferencedRemoteActors(app core.App, afterID string, visit func(Rem
 	if len(references) > 0 {
 		referenceCTE = strings.Join(references, " UNION ALL ")
 	}
-	candidateQuery := "WITH refs(actor_id) AS (" + referenceCTE + `)
-		SELECT a.id, a.iri, a.preferred_username, a.domain
-		FROM activitypub_actors a
-		WHERE a.is_local = 0 AND a.iri <> '' AND a.id > {:after}
-		  AND NOT EXISTS (SELECT 1 FROM refs r WHERE r.actor_id = a.id)
-		ORDER BY a.id`
+	candidateQuery := "WITH refs(actor_id) AS (" + referenceCTE + ") " +
+		"SELECT a.id, a.iri, a.preferred_username, a.domain " +
+		"FROM activitypub_actors a " +
+		"WHERE a.is_local = 0 AND a.iri <> '' AND a.id > {:after} " +
+		"AND NOT EXISTS (SELECT 1 FROM refs r WHERE r.actor_id = a.id) " +
+		"ORDER BY a.id LIMIT {:limit}"
 
-	candidateRows, err := app.DB().NewQuery(candidateQuery).Bind(dbx.Params{"after": afterID}).Rows()
-	if err != nil {
-		return fmt.Errorf("query relation-unreferenced remote actors: %w", err)
-	}
+	cursor := afterID
+	for {
+		candidateRows, err := app.DB().NewQuery(candidateQuery).Bind(dbx.Params{
+			"after": cursor, "limit": batchSize,
+		}).Rows()
+		if err != nil {
+			return fmt.Errorf("query relation-unreferenced remote actors: %w", err)
+		}
 
-	candidates := make([]RemoteActorCandidate, 0)
-	matcher := newActorReferenceMatcher()
-	for candidateRows.Next() {
-		var candidate RemoteActorCandidate
-		if err := candidateRows.Scan(&candidate.ID, &candidate.IRI, &candidate.PreferredUsername, &candidate.Domain); err != nil {
+		candidates := make([]RemoteActorCandidate, 0, batchSize)
+		matcher := newActorReferenceMatcher()
+		for candidateRows.Next() {
+			var candidate RemoteActorCandidate
+			if err := candidateRows.Scan(&candidate.ID, &candidate.IRI, &candidate.PreferredUsername, &candidate.Domain); err != nil {
+				candidateRows.Close()
+				return fmt.Errorf("scan remote actor candidate: %w", err)
+			}
+			candidates = append(candidates, candidate)
+			index := len(candidates) - 1
+			matcher.add(candidate.IRI, index, actorReferenceActivity|actorReferenceNotification)
+			matcher.add(candidate.ID, index, actorReferenceActivity|actorReferenceNotification)
+			if candidate.PreferredUsername != "" && candidate.Domain != "" {
+				matcher.add("@"+candidate.PreferredUsername+"@"+candidate.Domain, index, actorReferenceNotification)
+			}
+			cursor = candidate.ID
+		}
+		if err := candidateRows.Err(); err != nil {
 			candidateRows.Close()
-			return fmt.Errorf("scan remote actor candidate: %w", err)
+			return fmt.Errorf("read remote actor candidates: %w", err)
 		}
-		index := len(candidates)
-		candidates = append(candidates, candidate)
-		matcher.add(candidate.IRI, index, actorReferenceActivity|actorReferenceNotification)
-		matcher.add(candidate.ID, index, actorReferenceActivity|actorReferenceNotification)
-		if candidate.PreferredUsername != "" && candidate.Domain != "" {
-			matcher.add("@"+candidate.PreferredUsername+"@"+candidate.Domain, index, actorReferenceNotification)
+		if err := candidateRows.Close(); err != nil {
+			return fmt.Errorf("close remote actor candidates: %w", err)
 		}
-	}
-	if err := candidateRows.Err(); err != nil {
-		candidateRows.Close()
-		return fmt.Errorf("read remote actor candidates: %w", err)
-	}
-	if err := candidateRows.Close(); err != nil {
-		return fmt.Errorf("close remote actor candidates: %w", err)
-	}
-	if len(candidates) == 0 {
-		return nil
-	}
-	matcher.build()
+		if len(candidates) == 0 {
+			return nil
+		}
 
-	referenced := make([]bool, len(candidates))
-	activityRows, err := app.DB().NewQuery(`
-		SELECT COALESCE(actor, ''), COALESCE(object, ''), COALESCE(cc, ''),
-		       COALESCE("to", ''), COALESCE(relation, '')
-		FROM activitypub_activities`).Rows()
-	if err != nil {
-		return fmt.Errorf("query ActivityPub payload references: %w", err)
-	}
-	for activityRows.Next() {
-		var actor, object, cc, to, relation string
-		if err := activityRows.Scan(&actor, &object, &cc, &to, &relation); err != nil {
+		matcher.build()
+		referenced := make([]bool, len(candidates))
+
+		activityRows, err := app.DB().NewQuery(
+			"SELECT COALESCE(actor, ''), COALESCE(object, ''), COALESCE(cc, ''), " +
+				"COALESCE(\"to\", ''), COALESCE(relation, '') FROM activitypub_activities",
+		).Rows()
+		if err != nil {
+			return fmt.Errorf("query ActivityPub payload references: %w", err)
+		}
+		for activityRows.Next() {
+			var actor, object, cc, to, relation string
+			if err := activityRows.Scan(&actor, &object, &cc, &to, &relation); err != nil {
+				activityRows.Close()
+				return fmt.Errorf("scan ActivityPub payload references: %w", err)
+			}
+			// An actor's own outbox activity is purged with that actor. Its
+			// actor IRI is excluded as a match, but references to other actors count.
+			matcher.mark(object, actor, actorReferenceActivity, candidates, referenced)
+			matcher.mark(cc, actor, actorReferenceActivity, candidates, referenced)
+			matcher.mark(to, actor, actorReferenceActivity, candidates, referenced)
+			matcher.mark(relation, actor, actorReferenceActivity, candidates, referenced)
+		}
+		if err := activityRows.Err(); err != nil {
 			activityRows.Close()
-			return fmt.Errorf("scan ActivityPub payload references: %w", err)
+			return fmt.Errorf("read ActivityPub payload references: %w", err)
 		}
-		// An actor's own outbox activity is purged with that actor. Its
-		// actor IRI is excluded as a match, but references to other actors count.
-		matcher.mark(object, actor, actorReferenceActivity, candidates, referenced)
-		matcher.mark(cc, actor, actorReferenceActivity, candidates, referenced)
-		matcher.mark(to, actor, actorReferenceActivity, candidates, referenced)
-		matcher.mark(relation, actor, actorReferenceActivity, candidates, referenced)
-	}
-	if err := activityRows.Err(); err != nil {
-		activityRows.Close()
-		return fmt.Errorf("read ActivityPub payload references: %w", err)
-	}
-	if err := activityRows.Close(); err != nil {
-		return fmt.Errorf("close ActivityPub payload references: %w", err)
-	}
+		if err := activityRows.Close(); err != nil {
+			return fmt.Errorf("close ActivityPub payload references: %w", err)
+		}
 
-	notificationRows, err := app.DB().NewQuery(`
-		SELECT COALESCE(metadata, '') FROM notifications`).Rows()
-	if err != nil {
-		return fmt.Errorf("query notification payload references: %w", err)
-	}
-	for notificationRows.Next() {
-		var metadata string
-		if err := notificationRows.Scan(&metadata); err != nil {
+		notificationRows, err := app.DB().NewQuery(
+			"SELECT COALESCE(metadata, '') FROM notifications",
+		).Rows()
+		if err != nil {
+			return fmt.Errorf("query notification payload references: %w", err)
+		}
+		for notificationRows.Next() {
+			var metadata string
+			if err := notificationRows.Scan(&metadata); err != nil {
+				notificationRows.Close()
+				return fmt.Errorf("scan notification payload reference: %w", err)
+			}
+			matcher.mark(metadata, "", actorReferenceNotification, candidates, referenced)
+		}
+		if err := notificationRows.Err(); err != nil {
 			notificationRows.Close()
-			return fmt.Errorf("scan notification payload reference: %w", err)
+			return fmt.Errorf("read notification payload references: %w", err)
 		}
-		matcher.mark(metadata, "", actorReferenceNotification, candidates, referenced)
-	}
-	if err := notificationRows.Err(); err != nil {
-		notificationRows.Close()
-		return fmt.Errorf("read notification payload references: %w", err)
-	}
-	if err := notificationRows.Close(); err != nil {
-		return fmt.Errorf("close notification payload references: %w", err)
-	}
+		if err := notificationRows.Close(); err != nil {
+			return fmt.Errorf("close notification payload references: %w", err)
+		}
 
-	for index, candidate := range candidates {
-		if referenced[index] {
-			continue
-		}
-		if err := visit(candidate); err != nil {
-			return err
+		for index, candidate := range candidates {
+			if referenced[index] {
+				continue
+			}
+			if err := visit(candidate); err != nil {
+				return err
+			}
 		}
 	}
-	return nil
 }
 
 func quoteIdentifier(value string) string {
