@@ -8,7 +8,9 @@ It is intended to remove stale remote-actor cache entries, not user content.
 
 - **Dry-run is the default.** The command does not delete anything unless
   `--execute` is explicitly supplied.
-- Candidates are streamed in stable record-ID order. The scan can be limited
+- Candidates are processed in bounded batches of 5,000 in stable record-ID
+  order. Activity and notification payloads are rescanned for each batch, which
+  bounds memory at the cost of additional scan time. The scan can be limited
   with `--max-actors` and resumed with `--after-id` or `--checkpoint-file`.
 - Before deletion, the actor is reloaded and its reference graph is checked
   again inside the PocketBase deletion transaction. If a reference is found,
