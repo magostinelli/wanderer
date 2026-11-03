@@ -203,7 +203,6 @@ func StreamUnreferencedRemoteActors(app core.App, afterID string, visit func(Rem
 
 	candidates := make([]RemoteActorCandidate, 0)
 	matcher := newActorReferenceMatcher()
-	actorIndexByIRI := make(map[string]int)
 	for candidateRows.Next() {
 		var candidate RemoteActorCandidate
 		if err := candidateRows.Scan(&candidate.ID, &candidate.IRI, &candidate.PreferredUsername, &candidate.Domain); err != nil {
@@ -212,11 +211,10 @@ func StreamUnreferencedRemoteActors(app core.App, afterID string, visit func(Rem
 		}
 		index := len(candidates)
 		candidates = append(candidates, candidate)
-		actorIndexByIRI[candidate.IRI] = index
-		matcher.add(candidate.IRI, index)
-		matcher.add(candidate.ID, index)
+		matcher.add(candidate.IRI, index, actorReferenceActivity|actorReferenceNotification)
+		matcher.add(candidate.ID, index, actorReferenceActivity|actorReferenceNotification)
 		if candidate.PreferredUsername != "" && candidate.Domain != "" {
-			matcher.add("@"+candidate.PreferredUsername+"@"+candidate.Domain, index)
+			matcher.add("@"+candidate.PreferredUsername+"@"+candidate.Domain, index, actorReferenceNotification)
 		}
 	}
 	if err := candidateRows.Err(); err != nil {
@@ -245,16 +243,12 @@ func StreamUnreferencedRemoteActors(app core.App, afterID string, visit func(Rem
 			activityRows.Close()
 			return fmt.Errorf("scan ActivityPub payload references: %w", err)
 		}
-		excluded := -1
-		if index, ok := actorIndexByIRI[actor]; ok {
-			// An actor's own outbox activity is purged with that actor. It
-			// must not count as a reference to itself, but can reference others.
-			excluded = index
-		}
-		matcher.mark(object, excluded, referenced)
-		matcher.mark(cc, excluded, referenced)
-		matcher.mark(to, excluded, referenced)
-		matcher.mark(relation, excluded, referenced)
+		// An actor's own outbox activity is purged with that actor. Its
+		// actor IRI is excluded as a match, but references to other actors count.
+		matcher.mark(object, actor, actorReferenceActivity, candidates, referenced)
+		matcher.mark(cc, actor, actorReferenceActivity, candidates, referenced)
+		matcher.mark(to, actor, actorReferenceActivity, candidates, referenced)
+		matcher.mark(relation, actor, actorReferenceActivity, candidates, referenced)
 	}
 	if err := activityRows.Err(); err != nil {
 		activityRows.Close()
@@ -275,7 +269,7 @@ func StreamUnreferencedRemoteActors(app core.App, afterID string, visit func(Rem
 			notificationRows.Close()
 			return fmt.Errorf("scan notification payload reference: %w", err)
 		}
-		matcher.mark(metadata, -1, referenced)
+		matcher.mark(metadata, "", actorReferenceNotification, candidates, referenced)
 	}
 	if err := notificationRows.Err(); err != nil {
 		notificationRows.Close()
