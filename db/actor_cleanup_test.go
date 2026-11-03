@@ -163,6 +163,7 @@ func TestStreamUnreferencedRemoteActorsUsesReferenceGraph(t *testing.T) {
 		"iri": "https://remote.example/ap/actors/notificationonly", "inbox": "https://remote.example/inbox", "public_key": "remote-key",
 	})
 	saveInboundRecord(t, app, "notifications", map[string]any{
+			"author": follower.Id, "recipient": follower.Id, "type": "trail_mention",
 		"metadata": `{"actor":"@notificationonly@remote.example"}`,
 	})
 
