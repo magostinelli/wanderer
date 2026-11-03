@@ -185,30 +185,6 @@ func StreamUnreferencedRemoteActors(app core.App, afterID string, visit func(Rem
 		}
 	}
 
-	references = append(references,
-		`SELECT a.id AS actor_id
-		 FROM activitypub_actors a
-		 JOIN activitypub_activities x
-		   ON COALESCE(x.actor, '') <> a.iri
-		  AND (instr(COALESCE(x.object, ''), a.iri) > 0
-		    OR instr(COALESCE(x.cc, ''), a.iri) > 0
-		    OR instr(COALESCE(x."to", ''), a.iri) > 0
-		    OR instr(COALESCE(x.relation, ''), a.iri) > 0
-		    OR instr(COALESCE(x.object, ''), a.id) > 0
-		    OR instr(COALESCE(x.cc, ''), a.id) > 0
-		    OR instr(COALESCE(x."to", ''), a.id) > 0
-		    OR instr(COALESCE(x.relation, ''), a.id) > 0)
-		 WHERE a.is_local = 0 AND a.iri <> ''`,
-		`SELECT a.id AS actor_id
-		 FROM activitypub_actors a
-		 JOIN notifications n
-		   ON (instr(COALESCE(n.metadata, ''), a.iri) > 0
-		    OR instr(COALESCE(n.metadata, ''), a.id) > 0
-		    OR (a.preferred_username <> '' AND a.domain <> ''
-		        AND instr(COALESCE(n.metadata, ''), '@' || a.preferred_username || '@' || a.domain) > 0))
-		 WHERE a.is_local = 0 AND a.iri <> ''`,
-	)
-
 	// Remove actors already referenced through PocketBase relations before
 	// comparing ActivityPub payloads. The old plan joined every cached actor
 	// against every activity/notification, even when a relation had already
