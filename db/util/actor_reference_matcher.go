@@ -27,7 +27,7 @@ type actorReferenceMatcher struct {
 
 func newActorReferenceMatcher() *actorReferenceMatcher {
 	return &actorReferenceMatcher{
-		nodes: []actorReferenceNode{{next: make(map[byte]int)}},
+		nodes: []actorReferenceNode{{}},
 	}
 }
 
@@ -41,8 +41,11 @@ func (m *actorReferenceMatcher) add(pattern string, actor int, mask actorReferen
 		next, ok := m.nodes[state].next[char]
 		if !ok {
 			next = len(m.nodes)
+			if m.nodes[state].next == nil {
+				m.nodes[state].next = make(map[byte]int)
+			}
 			m.nodes[state].next[char] = next
-			m.nodes = append(m.nodes, actorReferenceNode{next: make(map[byte]int)})
+			m.nodes = append(m.nodes, actorReferenceNode{})
 		}
 		state = next
 	}
@@ -92,8 +95,8 @@ func (m *actorReferenceMatcher) build() {
 }
 
 // mark sets every actor whose pattern occurs in text. excludedIRI suppresses
-// only the matching actor's own IRI in its own activity; its ID and other
-// actors' identifiers still count. kind keeps notification-only handles out
+// all matches for the activity's actor are ignored, mirroring the SQL actor
+// inequality. kind keeps notification-only handles out
 // of ActivityPub activity matching.
 func (m *actorReferenceMatcher) mark(
 	text string,
