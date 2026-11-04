@@ -160,18 +160,11 @@ func TestStreamUnreferencedRemoteActorsUsesReferenceGraph(t *testing.T) {
 		"username": "NotificationOnly", "preferred_username": "notificationonly", "domain": "remote.example",
 		"iri": "https://remote.example/ap/actors/notificationonly", "inbox": "https://remote.example/inbox", "public_key": "remote-key",
 	})
-	users, err := app.FindCollectionByNameOrId("users")
-	if err != nil {
-		t.Fatal(err)
-	}
-	notificationUser := core.NewRecord(users)
-	notificationUser.Set("email", "cleanup-notification@example.com")
-	notificationUser.Set("username", "cleanup-notification")
-	if err := app.SaveNoValidate(notificationUser); err != nil {
-		t.Fatal(err)
-	}
+	// Notification author and recipient are ActivityPub actor relations in
+	// the current schema. Use an unrelated actor for both fields so the only
+	// reference to notificationOnly is the handle in metadata.
 	saveInboundRecord(t, app, "notifications", map[string]any{
-		"author": notificationUser.Id, "recipient": notificationUser.Id, "type": "trail_create",
+		"author": follower.Id, "recipient": follower.Id, "type": "trail_comment",
 		"metadata": `{"actor":"@notificationonly@remote.example"}`,
 	})
 
