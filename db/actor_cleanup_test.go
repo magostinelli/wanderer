@@ -188,7 +188,7 @@ func TestStreamUnreferencedRemoteActorsUsesReferenceGraph(t *testing.T) {
 	})
 
 	var candidates []util.RemoteActorCandidate
-	err := util.StreamUnreferencedRemoteActors(app, "", func(candidate util.RemoteActorCandidate) error {
+	err = util.StreamUnreferencedRemoteActors(app, "", func(candidate util.RemoteActorCandidate) error {
 		candidates = append(candidates, candidate)
 		return nil
 	})
